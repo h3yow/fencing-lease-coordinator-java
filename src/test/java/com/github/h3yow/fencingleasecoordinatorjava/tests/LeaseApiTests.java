@@ -141,4 +141,44 @@ class LeaseApiTests {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.errorCode").value("INVALID_REQUEST"));
     }
+
+    @Test
+    void httpSameRequestIdWithDifferentContentIsRejected() throws Exception {
+        store.reset();
+
+        mockMvc.perform(post("/api/leases/acquire")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body(
+                                "requestId", "http-dup-1",
+                                "resourceId", "widget-77",
+                                "holderId", "consumer-A",
+                                "ttlMillis", 500))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+
+        // identical replay is still served
+        mockMvc.perform(post("/api/leases/acquire")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body(
+                                "requestId", "http-dup-1",
+                                "resourceId", "widget-77",
+                                "holderId", "consumer-A",
+                                "ttlMillis", 500))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.replay").value(true));
+
+        // same requestId, different holder -> REQUEST_CONFLICT, old result NOT returned
+        MvcResult conflict = mockMvc.perform(post("/api/leases/acquire")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body(
+                                "requestId", "http-dup-1",
+                                "resourceId", "widget-77",
+                                "holderId", "consumer-B",
+                                "ttlMillis", 500))))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("REQUEST_CONFLICT"))
+                .andReturn();
+        log.info("[http] requestId reuse with different content -> {}",
+                conflict.getResponse().getContentAsString());
+    }
 }

@@ -19,6 +19,7 @@ public class InMemoryLeaseStore implements LeaseStore {
 
     private final Map<String, LeaseRecord> leases = new ConcurrentHashMap<>();
     private final Map<String, LeaseResponse> responses = new ConcurrentHashMap<>();
+    private final Map<String, String> responseFingerprints = new ConcurrentHashMap<>();
     private final Map<String, PersistentData.ResourceValue> resources = new ConcurrentHashMap<>();
     private final ReentrantLock lock = new ReentrantLock();
 
@@ -71,6 +72,33 @@ public class InMemoryLeaseStore implements LeaseStore {
     }
 
     @Override
+    public Optional<LeaseRecord> claimLeaseIfFree(String resourceId, String holderId,
+                                                  long acquiredAt, long expiresAt) {
+        lock.lock();
+        try {
+            LeaseRecord current = leases.get(resourceId);
+            if (current != null && current.getStatus() == com.github.h3yow.fencingleasecoordinatorjava.domain.LeaseStatus.HELD
+                    && current.getExpiresAt() > acquiredAt) {
+                return Optional.empty();
+            }
+            if (faultOnPersist) {
+                throw new StoreException("injected persistence I/O failure");
+            }
+            LeaseRecord next = new LeaseRecord();
+            next.setResourceId(resourceId);
+            next.setHolderId(holderId);
+            next.setToken(current == null ? 1L : current.getToken() + 1L);
+            next.setStatus(com.github.h3yow.fencingleasecoordinatorjava.domain.LeaseStatus.HELD);
+            next.setAcquiredAt(acquiredAt);
+            next.setExpiresAt(expiresAt);
+            leases.put(resourceId, next);
+            return Optional.of(next);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
     public Optional<String> getResourceData(String resourceId) {
         lock.lock();
         try {
@@ -113,26 +141,51 @@ public class InMemoryLeaseStore implements LeaseStore {
     }
 
     @Override
-    public Optional<LeaseResponse> getIdempotentResponse(String requestId) {
+    public Optional<com.github.h3yow.fencingleasecoordinatorjava.store.IdempotentRecord> findIdempotent(String requestId) {
         lock.lock();
         try {
-            return Optional.ofNullable(responses.get(requestId));
+            LeaseResponse response = responses.get(requestId);
+            if (response == null) {
+                return Optional.empty();
+            }
+            return Optional.of(new com.github.h3yow.fencingleasecoordinatorjava.store.IdempotentRecord(
+                    responseFingerprints.get(requestId), response));
         } finally {
             lock.unlock();
         }
     }
 
     @Override
-    public IdempotentResult replayOrCompute(String requestId, Function<String, LeaseResponse> computer) {
+    public IdempotentResult replayOrCompute(String requestId, String fingerprint,
+                                            Function<String, LeaseResponse> computer) {
         lock.lock();
         try {
             LeaseResponse existing = responses.get(requestId);
             if (existing != null) {
-                return new IdempotentResult(existing, true);
+                boolean mismatch = !java.util.Objects.equals(responseFingerprints.get(requestId), fingerprint);
+                return new IdempotentResult(existing, true, mismatch);
             }
             LeaseResponse computed = computer.apply(requestId);
             responses.put(requestId, computed);
-            return new IdempotentResult(computed, false);
+            responseFingerprints.put(requestId, fingerprint);
+            return new IdempotentResult(computed, false, false);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public IdempotentResult putIdempotentIfAbsent(String requestId, String fingerprint, LeaseResponse response) {
+        lock.lock();
+        try {
+            LeaseResponse existing = responses.get(requestId);
+            if (existing != null) {
+                boolean mismatch = !java.util.Objects.equals(responseFingerprints.get(requestId), fingerprint);
+                return new IdempotentResult(existing, true, mismatch);
+            }
+            responses.put(requestId, response);
+            responseFingerprints.put(requestId, fingerprint);
+            return new IdempotentResult(response, false, false);
         } finally {
             lock.unlock();
         }
@@ -144,6 +197,7 @@ public class InMemoryLeaseStore implements LeaseStore {
         try {
             leases.clear();
             responses.clear();
+            responseFingerprints.clear();
             resources.clear();
             faultOnPersist = false;
         } finally {

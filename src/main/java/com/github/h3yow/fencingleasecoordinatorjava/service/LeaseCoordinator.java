@@ -18,5 +18,8 @@ public interface LeaseCoordinator {
 
     LeaseResponse inspect(String resourceId);
 
+    /** Current number of queued waiters for a resource (observability). */
+    int waitQueueSize(String resourceId);
+
     int reapExpired();
 }

@@ -110,6 +110,32 @@ public class FileLeaseStore implements LeaseStore {
     }
 
     @Override
+    public Optional<LeaseRecord> claimLeaseIfFree(String resourceId, String holderId,
+                                                  long acquiredAt, long expiresAt) {
+        lock.lock();
+        try {
+            ensureLoaded();
+            LeaseRecord current = data.getLeases().get(resourceId);
+            if (current != null && current.getStatus() == com.github.h3yow.fencingleasecoordinatorjava.domain.LeaseStatus.HELD
+                    && current.getExpiresAt() > acquiredAt) {
+                return Optional.empty();
+            }
+            LeaseRecord next = new LeaseRecord();
+            next.setResourceId(resourceId);
+            next.setHolderId(holderId);
+            next.setToken(current == null ? 1L : current.getToken() + 1L);
+            next.setStatus(com.github.h3yow.fencingleasecoordinatorjava.domain.LeaseStatus.HELD);
+            next.setAcquiredAt(acquiredAt);
+            next.setExpiresAt(expiresAt);
+            data.getLeases().put(resourceId, next);
+            persist();
+            return Optional.of(next);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
     public Optional<String> getResourceData(String resourceId) {
         lock.lock();
         try {
@@ -155,34 +181,57 @@ public class FileLeaseStore implements LeaseStore {
     }
 
     @Override
-    public Optional<LeaseResponse> getIdempotentResponse(String requestId) {
+    public Optional<IdempotentRecord> findIdempotent(String requestId) {
         lock.lock();
         try {
             ensureLoaded();
-            return Optional.ofNullable(data.getResponses().get(requestId));
+            LeaseResponse response = data.getResponses().get(requestId);
+            if (response == null) {
+                return Optional.empty();
+            }
+            return Optional.of(new IdempotentRecord(data.getResponseFingerprints().get(requestId), response));
         } finally {
             lock.unlock();
         }
     }
 
     @Override
-    public IdempotentResult replayOrCompute(String requestId, Function<String, LeaseResponse> computer) {
+    public IdempotentResult replayOrCompute(String requestId, String fingerprint,
+                                            Function<String, LeaseResponse> computer) {
         lock.lock();
         try {
             ensureLoaded();
             LeaseResponse existing = data.getResponses().get(requestId);
             if (existing != null) {
-                return new IdempotentResult(existing, true);
+                boolean mismatch = !java.util.Objects.equals(
+                        data.getResponseFingerprints().get(requestId), fingerprint);
+                return new IdempotentResult(existing, true, mismatch);
             }
-            LeaseResponse computed;
-            try {
-                computed = computer.apply(requestId);
-            } catch (RuntimeException ex) {
-                throw ex;
-            }
+            LeaseResponse computed = computer.apply(requestId);
             data.getResponses().put(requestId, computed);
+            data.getResponseFingerprints().put(requestId, fingerprint);
             persist();
-            return new IdempotentResult(computed, false);
+            return new IdempotentResult(computed, false, false);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public IdempotentResult putIdempotentIfAbsent(String requestId, String fingerprint, LeaseResponse response) {
+        lock.lock();
+        try {
+            ensureLoaded();
+            LeaseResponse existing = data.getResponses().get(requestId);
+            if (existing != null) {
+                boolean mismatch = !java.util.Objects.equals(
+                        data.getResponseFingerprints().get(requestId), fingerprint);
+                return new IdempotentResult(existing, true, mismatch);
+            }
+            data.getResponses().put(requestId, response);
+            data.getResponseFingerprints().put(requestId, fingerprint);
+            persist();
+            return new IdempotentResult(response, false, false);
         } finally {
             lock.unlock();
         }
