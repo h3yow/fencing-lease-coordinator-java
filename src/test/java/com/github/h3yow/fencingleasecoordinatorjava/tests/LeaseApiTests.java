@@ -141,4 +141,68 @@ class LeaseApiTests {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.errorCode").value("INVALID_REQUEST"));
     }
+
+    @Test
+    void httpWaitAcquireTimeoutAndRequestMismatch() throws Exception {
+        store.reset();
+
+        // Owner holds the lease.
+        mockMvc.perform(post("/api/leases/acquire")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body(
+                                "requestId", "http-wait-owner",
+                                "resourceId", "widget-wait",
+                                "holderId", "owner",
+                                "ttlMillis", 60000))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.token").value(1));
+
+        // Waiting acquire blocks in the controller thread; run it async and let the
+        // mock clock push it past its wait deadline.
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newSingleThreadExecutor();
+        java.util.concurrent.Future<MvcResult> waiting = pool.submit(() -> mockMvc.perform(
+                        post("/api/leases/acquire")
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(objectMapper.writeValueAsString(body(
+                                        "requestId", "http-wait-1",
+                                        "resourceId", "widget-wait",
+                                        "holderId", "waiter",
+                                        "ttlMillis", 1000,
+                                        "waitMillis", 300))))
+                .andReturn());
+        Thread.sleep(300); // allow the request to enqueue
+        clock.advance(400);
+
+        MvcResult timedOut = waiting.get(5, java.util.concurrent.TimeUnit.SECONDS);
+        pool.shutdown();
+        log.info("[http] wait timeout -> {}", timedOut.getResponse().getContentAsString());
+        JsonNode timeoutJson = objectMapper.readTree(timedOut.getResponse().getContentAsString());
+        org.junit.jupiter.api.Assertions.assertEquals(408, timedOut.getResponse().getStatus());
+        org.junit.jupiter.api.Assertions.assertEquals("WAIT_TIMEOUT", timeoutJson.path("errorCode").asText());
+
+        // Same requestId + same content -> recorded WAIT_TIMEOUT replayed.
+        mockMvc.perform(post("/api/leases/acquire")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body(
+                                "requestId", "http-wait-1",
+                                "resourceId", "widget-wait",
+                                "holderId", "waiter",
+                                "ttlMillis", 1000,
+                                "waitMillis", 300))))
+                .andExpect(status().is(408))
+                .andExpect(jsonPath("$.errorCode").value("WAIT_TIMEOUT"))
+                .andExpect(jsonPath("$.replay").value(true));
+
+        // Same requestId + different content -> REQUEST_MISMATCH (409), old result not returned.
+        mockMvc.perform(post("/api/leases/acquire")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body(
+                                "requestId", "http-wait-1",
+                                "resourceId", "widget-wait",
+                                "holderId", "someone-else",
+                                "ttlMillis", 1000,
+                                "waitMillis", 300))))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("REQUEST_MISMATCH"));
+    }
 }

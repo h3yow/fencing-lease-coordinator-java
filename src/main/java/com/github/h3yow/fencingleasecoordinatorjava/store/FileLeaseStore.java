@@ -3,6 +3,9 @@ package com.github.h3yow.fencingleasecoordinatorjava.store;
 import com.github.h3yow.fencingleasecoordinatorjava.config.LeaseProperties;
 import com.github.h3yow.fencingleasecoordinatorjava.domain.LeaseRecord;
 import com.github.h3yow.fencingleasecoordinatorjava.dto.LeaseResponse;
+import com.github.h3yow.fencingleasecoordinatorjava.error.LeaseErrorCode;
+import com.github.h3yow.fencingleasecoordinatorjava.error.LeaseException;
+import com.github.h3yow.fencingleasecoordinatorjava.error.StoreConflictException;
 import com.github.h3yow.fencingleasecoordinatorjava.error.StoreException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
@@ -82,7 +85,7 @@ public class FileLeaseStore implements LeaseStore {
             ensureLoaded();
             LeaseRecord current = data.getLeases().get(resourceId);
             if (!sameIdentity(current, expected)) {
-                throw new StoreException("optimistic-create conflict on resource " + resourceId);
+                throw new StoreConflictException("optimistic-create conflict on resource " + resourceId);
             }
             data.getLeases().put(resourceId, next);
             persist();
@@ -98,7 +101,7 @@ public class FileLeaseStore implements LeaseStore {
             ensureLoaded();
             LeaseRecord current = data.getLeases().get(resourceId);
             if (!sameIdentity(current, expected)) {
-                throw new StoreException("optimistic-replace conflict on resource " + resourceId
+                throw new StoreConflictException("optimistic-replace conflict on resource " + resourceId
                         + " (expected token " + (expected == null ? null : expected.getToken())
                         + ", actual token " + (current == null ? null : current.getToken()) + ")");
             }
@@ -141,7 +144,7 @@ public class FileLeaseStore implements LeaseStore {
             PersistentData.ResourceValue current = data.getResources().get(resourceId);
             long currentVersion = current == null ? 0L : current.getVersion();
             if (currentVersion != version) {
-                throw new StoreException("resource version conflict on " + resourceId
+                throw new StoreConflictException("resource version conflict on " + resourceId
                         + " (expected " + version + ", actual " + currentVersion + ")");
             }
             PersistentData.ResourceValue next = new PersistentData.ResourceValue();
@@ -166,12 +169,15 @@ public class FileLeaseStore implements LeaseStore {
     }
 
     @Override
-    public IdempotentResult replayOrCompute(String requestId, Function<String, LeaseResponse> computer) {
+    public IdempotentResult replayOrCompute(String requestId, String fingerprint,
+                                            Function<String, LeaseResponse> computer,
+                                            java.util.function.Predicate<LeaseResponse> recordable) {
         lock.lock();
         try {
             ensureLoaded();
             LeaseResponse existing = data.getResponses().get(requestId);
             if (existing != null) {
+                checkFingerprint(requestId, fingerprint);
                 return new IdempotentResult(existing, true);
             }
             LeaseResponse computed;
@@ -180,11 +186,24 @@ public class FileLeaseStore implements LeaseStore {
             } catch (RuntimeException ex) {
                 throw ex;
             }
-            data.getResponses().put(requestId, computed);
-            persist();
+            if (recordable.test(computed)) {
+                data.getResponses().put(requestId, computed);
+                data.getRequestFingerprints().put(requestId, fingerprint);
+                persist();
+            }
             return new IdempotentResult(computed, false);
         } finally {
             lock.unlock();
+        }
+    }
+
+    private void checkFingerprint(String requestId, String fingerprint) {
+        String recorded = data.getRequestFingerprints().get(requestId);
+        if (recorded != null && !recorded.equals(fingerprint)) {
+            log.warn("idempotency mismatch requestId={} recorded='{}' presented='{}'",
+                    requestId, recorded, fingerprint);
+            throw new LeaseException(LeaseErrorCode.REQUEST_MISMATCH,
+                    "requestId '" + requestId + "' was already used with different request content");
         }
     }
 

@@ -2,6 +2,9 @@ package com.github.h3yow.fencingleasecoordinatorjava.tests;
 
 import com.github.h3yow.fencingleasecoordinatorjava.domain.LeaseRecord;
 import com.github.h3yow.fencingleasecoordinatorjava.dto.LeaseResponse;
+import com.github.h3yow.fencingleasecoordinatorjava.error.LeaseErrorCode;
+import com.github.h3yow.fencingleasecoordinatorjava.error.LeaseException;
+import com.github.h3yow.fencingleasecoordinatorjava.error.StoreConflictException;
 import com.github.h3yow.fencingleasecoordinatorjava.error.StoreException;
 import com.github.h3yow.fencingleasecoordinatorjava.store.IdempotentResult;
 import com.github.h3yow.fencingleasecoordinatorjava.store.LeaseStore;
@@ -19,6 +22,7 @@ public class InMemoryLeaseStore implements LeaseStore {
 
     private final Map<String, LeaseRecord> leases = new ConcurrentHashMap<>();
     private final Map<String, LeaseResponse> responses = new ConcurrentHashMap<>();
+    private final Map<String, String> fingerprints = new ConcurrentHashMap<>();
     private final Map<String, PersistentData.ResourceValue> resources = new ConcurrentHashMap<>();
     private final ReentrantLock lock = new ReentrantLock();
 
@@ -40,7 +44,7 @@ public class InMemoryLeaseStore implements LeaseStore {
         try {
             LeaseRecord current = leases.get(resourceId);
             if (!sameIdentity(current, expected)) {
-                throw new StoreException("in-memory create conflict on " + resourceId);
+                throw new StoreConflictException("in-memory create conflict on " + resourceId);
             }
             if (faultOnPersist) {
                 throw new StoreException("injected persistence I/O failure");
@@ -57,7 +61,7 @@ public class InMemoryLeaseStore implements LeaseStore {
         try {
             LeaseRecord current = leases.get(resourceId);
             if (!sameIdentity(current, expected)) {
-                throw new StoreException("in-memory replace conflict on " + resourceId
+                throw new StoreConflictException("in-memory replace conflict on " + resourceId
                         + " expectedToken=" + (expected == null ? null : expected.getToken())
                         + " actualToken=" + (current == null ? null : current.getToken()));
             }
@@ -98,7 +102,7 @@ public class InMemoryLeaseStore implements LeaseStore {
             PersistentData.ResourceValue current = resources.get(resourceId);
             long currentVersion = current == null ? 0L : current.getVersion();
             if (currentVersion != version) {
-                throw new StoreException("in-memory version conflict on " + resourceId);
+                throw new StoreConflictException("in-memory version conflict on " + resourceId);
             }
             if (faultOnPersist) {
                 throw new StoreException("injected persistence I/O failure");
@@ -123,15 +127,25 @@ public class InMemoryLeaseStore implements LeaseStore {
     }
 
     @Override
-    public IdempotentResult replayOrCompute(String requestId, Function<String, LeaseResponse> computer) {
+    public IdempotentResult replayOrCompute(String requestId, String fingerprint,
+                                            Function<String, LeaseResponse> computer,
+                                            java.util.function.Predicate<LeaseResponse> recordable) {
         lock.lock();
         try {
             LeaseResponse existing = responses.get(requestId);
             if (existing != null) {
+                String recorded = fingerprints.get(requestId);
+                if (recorded != null && !recorded.equals(fingerprint)) {
+                    throw new LeaseException(LeaseErrorCode.REQUEST_MISMATCH,
+                            "requestId '" + requestId + "' was already used with different request content");
+                }
                 return new IdempotentResult(existing, true);
             }
             LeaseResponse computed = computer.apply(requestId);
-            responses.put(requestId, computed);
+            if (recordable.test(computed)) {
+                responses.put(requestId, computed);
+                fingerprints.put(requestId, fingerprint);
+            }
             return new IdempotentResult(computed, false);
         } finally {
             lock.unlock();
@@ -144,6 +158,7 @@ public class InMemoryLeaseStore implements LeaseStore {
         try {
             leases.clear();
             responses.clear();
+            fingerprints.clear();
             resources.clear();
             faultOnPersist = false;
         } finally {

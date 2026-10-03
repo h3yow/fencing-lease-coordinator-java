@@ -13,6 +13,9 @@ public class LeaseProperties {
     private String storeFile = "data/lease-store.json";
     private long reapIntervalMillis = 2_000L;
     private boolean reapEnabled = true;
+    private long maxWaitMillis = 30_000L;
+    private int maxWaitersPerResource = 64;
+    private int maxTotalWaiters = 1_024;
 
     public long getDefaultTtlMillis() { return defaultTtlMillis; }
     public void setDefaultTtlMillis(long v) { this.defaultTtlMillis = v; }
@@ -26,4 +29,10 @@ public class LeaseProperties {
     public void setReapIntervalMillis(long v) { this.reapIntervalMillis = v; }
     public boolean isReapEnabled() { return reapEnabled; }
     public void setReapEnabled(boolean v) { this.reapEnabled = v; }
+    public long getMaxWaitMillis() { return maxWaitMillis; }
+    public void setMaxWaitMillis(long v) { this.maxWaitMillis = v; }
+    public int getMaxWaitersPerResource() { return maxWaitersPerResource; }
+    public void setMaxWaitersPerResource(int v) { this.maxWaitersPerResource = v; }
+    public int getMaxTotalWaiters() { return maxTotalWaiters; }
+    public void setMaxTotalWaiters(int v) { this.maxTotalWaiters = v; }
 }

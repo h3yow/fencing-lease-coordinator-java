@@ -10,6 +10,7 @@ import com.github.h3yow.fencingleasecoordinatorjava.dto.RenewRequest;
 import com.github.h3yow.fencingleasecoordinatorjava.dto.WriteRequest;
 import com.github.h3yow.fencingleasecoordinatorjava.error.LeaseErrorCode;
 import com.github.h3yow.fencingleasecoordinatorjava.error.LeaseException;
+import com.github.h3yow.fencingleasecoordinatorjava.error.StoreConflictException;
 import com.github.h3yow.fencingleasecoordinatorjava.error.StoreException;
 import com.github.h3yow.fencingleasecoordinatorjava.store.IdempotentResult;
 import com.github.h3yow.fencingleasecoordinatorjava.store.LeaseStore;
@@ -22,22 +23,37 @@ public class DefaultLeaseCoordinator implements LeaseCoordinator {
 
     private static final Logger log = LoggerFactory.getLogger(DefaultLeaseCoordinator.class);
 
+    /** How long a waiter parks per iteration; short slices notice clock-driven expiry. */
+    private static final long WAIT_SLICE_MILLIS = 50L;
+
+    /** Sentinel used to probe the idempotency log without computing. */
+    private static final RuntimeException NOT_RECORDED = new RuntimeException("not recorded yet");
+
     private final LeaseStore store;
     private final LeaseProperties properties;
     private final SystemMillisClock clock;
+    private final LeaseWaitQueue waitQueue;
 
     public DefaultLeaseCoordinator(LeaseStore store, LeaseProperties properties, SystemMillisClock clock) {
         this.store = store;
         this.properties = properties;
         this.clock = clock;
+        this.waitQueue = new LeaseWaitQueue(properties.getMaxWaitersPerResource(),
+                properties.getMaxTotalWaiters());
     }
 
     @Override
     public LeaseResponse acquire(AcquireRequest request) {
         validate(request.getResourceId(), request.getHolderId(), request.getRequestId());
         long ttl = normalizeTtl(request.getTtlMillis());
-        return runIdempotent(request.getRequestId(), "acquire",
-                rid -> doAcquire(rid, request.getResourceId(), request.getHolderId(), ttl));
+        Long waitMillis = normalizeWait(request.getWaitMillis());
+        String fingerprint = fingerprint("acquire", request.getResourceId(), request.getHolderId(),
+                "ttl=" + ttl, "wait=" + request.getWaitMillis());
+        if (waitMillis == null) {
+            return runIdempotent(request.getRequestId(), "acquire", fingerprint,
+                    rid -> doAcquire(rid, request.getResourceId(), request.getHolderId(), ttl));
+        }
+        return acquireWithWait(request, ttl, waitMillis, fingerprint);
     }
 
     private LeaseResponse doAcquire(String requestId, String resourceId, String holderId, long ttl) {
@@ -80,12 +96,164 @@ public class DefaultLeaseCoordinator implements LeaseCoordinator {
         return ok(requestId, "acquire", resourceId, holderId, next, false, decision);
     }
 
+    /**
+     * Blocking acquire: queues behind other waiters of the same resource in FIFO
+     * order and waits up to {@code waitMillis} for the lease to be released or to
+     * expire. Only the head waiter may attempt a grant, so exactly one waiter wins
+     * and tokens stay strictly monotonic. A wait that elapses without a grant is
+     * recorded as WAIT_TIMEOUT (itself idempotently replayable); QUEUE_FULL and
+     * storage failures are transient and never recorded.
+     */
+    private LeaseResponse acquireWithWait(AcquireRequest request, long ttl, long waitMillis, String fingerprint) {
+        String requestId = request.getRequestId();
+        String resourceId = request.getResourceId();
+        String holderId = request.getHolderId();
+
+        // A duplicate of an already finished request must not queue again.
+        LeaseResponse alreadyRecorded = recordedResponse(requestId, fingerprint);
+        if (alreadyRecorded != null) {
+            return alreadyRecorded;
+        }
+
+        long deadline = clock.now() + waitMillis;
+
+        // Fast path: nobody waiting and the lease is free -> grant without queueing.
+        if (waitQueue.size(resourceId) == 0 && leaseAvailable(resourceId, clock.now())) {
+            LeaseResponse granted = tryGrantOnce(requestId, fingerprint, resourceId, holderId, ttl);
+            if (granted != null) {
+                return granted;
+            }
+        }
+
+        LeaseWaitQueue.Waiter waiter = waitQueue.enqueueOrJoin(resourceId, requestId, holderId);
+        log.info("wait-acquire requestId={} resource={} holder={} waitMillis={} deadline={} queueSize={}",
+                requestId, resourceId, holderId, waitMillis, deadline, waitQueue.size(resourceId));
+        try {
+            while (true) {
+                long now = clock.now();
+                if (now >= deadline) {
+                    LeaseResponse timeout = waitTimeoutResponse(requestId, resourceId, holderId,
+                            waitMillis, deadline);
+                    return runIdempotent(requestId, "acquire", fingerprint, rid -> timeout);
+                }
+                if (waitQueue.isHead(waiter)) {
+                    if (leaseAvailable(resourceId, now)) {
+                        LeaseResponse granted = tryGrantOnce(requestId, fingerprint, resourceId,
+                                holderId, ttl);
+                        if (granted != null) {
+                            log.info("wait-acquire granted requestId={} resource={} holder={} token={} "
+                                            + "decision='reached head of FIFO queue and lease became available'",
+                                    requestId, resourceId, holderId, granted.token());
+                            return granted;
+                        }
+                    }
+                } else {
+                    // A duplicate thread sharing this requestId may have finished the request
+                    // (grant or recorded timeout) and dequeued the shared waiter.
+                    LeaseResponse recorded = recordedResponse(requestId, fingerprint);
+                    if (recorded != null) {
+                        log.info("wait-acquire requestId={} resource={} decision='duplicate observed "
+                                + "recorded outcome of shared request'", requestId, resourceId);
+                        return recorded;
+                    }
+                }
+                waitQueue.awaitTurn(waiter, Math.min(deadline - now, WAIT_SLICE_MILLIS));
+            }
+        } finally {
+            waitQueue.remove(waiter);
+        }
+    }
+
+    /** Returns the recorded idempotent outcome for the requestId, or null if none exists yet. */
+    private LeaseResponse recordedResponse(String requestId, String fingerprint) {
+        try {
+            return runIdempotent(requestId, "acquire", fingerprint, rid -> {
+                throw NOT_RECORDED;
+            });
+        } catch (RuntimeException notRecorded) {
+            if (notRecorded != NOT_RECORDED) {
+                throw notRecorded;
+            }
+            return null;
+        }
+    }
+
+    /**
+     * Single grant attempt for a waiting request. Returns the final response when
+     * the attempt produced one (grant succeeded, or a previously recorded outcome
+     * was replayed), or {@code null} when the lease is still contested and the
+     * caller should keep waiting. Only successful grants are recorded here, so a
+     * CONFLICT never poisons the idempotency log of a still-waiting request.
+     */
+    private LeaseResponse tryGrantOnce(String requestId, String fingerprint,
+                                       String resourceId, String holderId, long ttl) {
+        IdempotentResult result;
+        try {
+            result = store.replayOrCompute(requestId, fingerprint,
+                    rid -> doAcquire(rid, resourceId, holderId, ttl), LeaseResponse::success);
+        } catch (LeaseException e) {
+            if (e.getCause() instanceof StoreConflictException) {
+                log.info("wait-acquire contested requestId={} resource={} decision='lost CAS race, keep waiting'",
+                        requestId, resourceId);
+                return null;
+            }
+            throw e;
+        } catch (StoreException e) {
+            throw new LeaseException(LeaseErrorCode.TEMPORARILY_UNAVAILABLE,
+                    "storage unavailable while waiting to acquire: " + e.getMessage(), e);
+        }
+        LeaseResponse response = result.response();
+        if (result.replay()) {
+            log.info("wait-acquire replay requestId={} resource={} token={} success={} errorCode={}",
+                    requestId, resourceId, response.token(), response.success(), response.errorCode());
+            return withReplay(response);
+        }
+        return response.success() ? response : null;
+    }
+
+    private LeaseResponse waitTimeoutResponse(String requestId, String resourceId, String holderId,
+                                              long waitMillis, long deadline) {
+        LeaseRecord current = store.findLease(resourceId).orElse(null);
+        String holderInfo = current == null ? "no record"
+                : "holder='" + current.getHolderId() + "' token=" + current.getToken()
+                        + " status=" + current.getStatus() + " expiresAt=" + current.getExpiresAt();
+        return reject(requestId, "acquire", resourceId, holderId, null, current,
+                LeaseErrorCode.WAIT_TIMEOUT,
+                "waited " + waitMillis + "ms for resource '" + resourceId
+                        + "' but it was still unavailable (" + holderInfo + ")",
+                "wait budget " + waitMillis + "ms elapsed at " + deadline
+                        + " without release/expiry -> WAIT_TIMEOUT (distinct from CONFLICT and"
+                        + " TEMPORARILY_UNAVAILABLE); waiter left the queue and cannot win later");
+    }
+
+    private boolean leaseAvailable(String resourceId, long now) {
+        LeaseRecord rec = store.findLease(resourceId).orElse(null);
+        return rec == null || rec.getStatus() != LeaseStatus.HELD || rec.getExpiresAt() <= now;
+    }
+
+    /** Number of currently queued waiting acquire requests for a resource (diagnostics/tests). */
+    public int pendingWaiters(String resourceId) {
+        return waitQueue.size(resourceId);
+    }
+
+    private Long normalizeWait(Long waitMillis) {
+        if (waitMillis == null) {
+            return null;
+        }
+        if (waitMillis <= 0) {
+            throw new LeaseException(LeaseErrorCode.INVALID_REQUEST, "waitMillis must be positive");
+        }
+        return Math.min(waitMillis, properties.getMaxWaitMillis());
+    }
+
     @Override
     public LeaseResponse renew(RenewRequest request) {
         validate(request.getResourceId(), request.getHolderId(), request.getRequestId());
         requireToken(request.getToken());
         long ttl = normalizeTtl(request.getTtlMillis());
-        return runIdempotent(request.getRequestId(), "renew",
+        String fingerprint = fingerprint("renew", request.getResourceId(), request.getHolderId(),
+                "token=" + request.getToken(), "ttl=" + ttl);
+        return runIdempotent(request.getRequestId(), "renew", fingerprint,
                 rid -> doRenew(rid, request.getResourceId(), request.getHolderId(), request.getToken(), ttl));
     }
 
@@ -139,8 +307,14 @@ public class DefaultLeaseCoordinator implements LeaseCoordinator {
     public LeaseResponse release(ReleaseRequest request) {
         validate(request.getResourceId(), request.getHolderId(), request.getRequestId());
         requireToken(request.getToken());
-        return runIdempotent(request.getRequestId(), "release",
+        String fingerprint = fingerprint("release", request.getResourceId(), request.getHolderId(),
+                "token=" + request.getToken());
+        LeaseResponse response = runIdempotent(request.getRequestId(), "release", fingerprint,
                 rid -> doRelease(rid, request.getResourceId(), request.getHolderId(), request.getToken()));
+        if (response.success()) {
+            waitQueue.signal(request.getResourceId());
+        }
+        return response;
     }
 
     private LeaseResponse doRelease(String requestId, String resourceId, String holderId, long token) {
@@ -193,7 +367,9 @@ public class DefaultLeaseCoordinator implements LeaseCoordinator {
         if (request.getValue() == null) {
             throw new LeaseException(LeaseErrorCode.INVALID_REQUEST, "value must not be null");
         }
-        return runIdempotent(request.getRequestId(), "write",
+        String fingerprint = fingerprint("write", request.getResourceId(), request.getHolderId(),
+                "token=" + request.getToken(), "value=" + request.getValue());
+        return runIdempotent(request.getRequestId(), "write", fingerprint,
                 rid -> doWrite(rid, request.getResourceId(), request.getHolderId(),
                         request.getToken(), request.getValue()));
     }
@@ -276,6 +452,7 @@ public class DefaultLeaseCoordinator implements LeaseCoordinator {
                     reaped[0]++;
                     log.info("reaper resource={} token={} expiredAt={} marked EXPIRED",
                             resourceId, rec.getToken(), rec.getExpiresAt());
+                    waitQueue.signal(resourceId);
                 } catch (StoreException e) {
                     log.warn("reaper skipped resource={} due to storage conflict: {}", resourceId, e.getMessage());
                 }
@@ -288,10 +465,16 @@ public class DefaultLeaseCoordinator implements LeaseCoordinator {
         return new java.util.ArrayList<>(store.allResourceIds());
     }
 
-    private LeaseResponse runIdempotent(String requestId, String action,
+    private LeaseResponse runIdempotent(String requestId, String action, String fingerprint,
                                         java.util.function.Function<String, LeaseResponse> computer) {
+        return runIdempotent(requestId, action, fingerprint, computer, r -> true);
+    }
+
+    private LeaseResponse runIdempotent(String requestId, String action, String fingerprint,
+                                        java.util.function.Function<String, LeaseResponse> computer,
+                                        java.util.function.Predicate<LeaseResponse> recordable) {
         try {
-            IdempotentResult result = store.replayOrCompute(requestId, computer);
+            IdempotentResult result = store.replayOrCompute(requestId, fingerprint, computer, recordable);
             LeaseResponse response = result.response();
             if (result.replay()) {
                 response = withReplay(response);
@@ -359,6 +542,14 @@ public class DefaultLeaseCoordinator implements LeaseCoordinator {
         }
         ttl = Math.max(properties.getMinTtlMillis(), Math.min(properties.getMaxTtlMillis(), ttl));
         return ttl;
+    }
+
+    private static String fingerprint(String action, String resourceId, String holderId, String... parts) {
+        StringBuilder sb = new StringBuilder(action).append('|').append(resourceId).append('|').append(holderId);
+        for (String part : parts) {
+            sb.append('|').append(part);
+        }
+        return sb.toString();
     }
 
     private static void validate(String resourceId, String holderId, String requestId) {

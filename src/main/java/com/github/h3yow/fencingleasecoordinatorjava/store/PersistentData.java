@@ -10,12 +10,15 @@ public class PersistentData {
 
     private Map<String, LeaseRecord> leases = new HashMap<>();
     private Map<String, LeaseResponse> responses = new HashMap<>();
+    private Map<String, String> requestFingerprints = new HashMap<>();
     private Map<String, ResourceValue> resources = new HashMap<>();
 
     public Map<String, LeaseRecord> getLeases() { return leases; }
     public void setLeases(Map<String, LeaseRecord> leases) { this.leases = leases; }
     public Map<String, LeaseResponse> getResponses() { return responses; }
     public void setResponses(Map<String, LeaseResponse> responses) { this.responses = responses; }
+    public Map<String, String> getRequestFingerprints() { return requestFingerprints; }
+    public void setRequestFingerprints(Map<String, String> requestFingerprints) { this.requestFingerprints = requestFingerprints; }
     public Map<String, ResourceValue> getResources() { return resources; }
     public void setResources(Map<String, ResourceValue> resources) { this.resources = resources; }
 
